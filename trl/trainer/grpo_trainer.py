@@ -64,6 +64,7 @@ from ..data_utils import (
     prepare_multimodal_messages,
 )
 from ..extras.profiling import profiling_context, profiling_decorator
+from ..generation.hf_generation import HFGeneration
 from ..generation.vllm_generation import VLLMGeneration
 from ..import_utils import is_jmespath_available, is_liger_kernel_available
 from ..models import prepare_deepspeed, prepare_fsdp, unwrap_model_for_generation
@@ -528,6 +529,9 @@ class GRPOTrainer(_BaseTrainer):
         self.repetition_penalty = args.repetition_penalty
         self.use_transformers_paged = args.use_transformers_paged
         self.pad_to_multiple_of = args.pad_to_multiple_of
+        self.use_hf = args.use_hf
+        if sum([bool(args.use_vllm), bool(args.use_hf)]) > 1:
+            raise ValueError("`use_vllm` and `use_hf` are mutually exclusive. Pick one generation backend.")
         self.use_vllm = args.use_vllm
         self.vllm_mode = args.vllm_mode
         self.vllm_gpu_memory_utilization = args.vllm_gpu_memory_utilization  # only applies to colocation mode
@@ -705,7 +709,36 @@ class GRPOTrainer(_BaseTrainer):
         # it's safer to set it in all cases.
         set_seed(args.seed, device_specific=True)
 
-        if self.use_vllm:
+        if self.use_hf:
+            # Initialize HF serve-mode generation backend (separate-process HF
+            # transformers `.generate()` with torch.compile, HTTP + ZMQ weight sync)
+            self.hf_generation = HFGeneration(
+                model=self.model,
+                accelerator=self.accelerator,
+                is_fsdp_enabled=self.is_fsdp_enabled,
+                processing_class=self.processing_class,
+                # Server configuration
+                server_base_url=args.hf_server_base_url,
+                server_host=args.hf_server_host,
+                server_port=args.hf_server_port,
+                server_timeout=args.hf_server_timeout,
+                zmq_port=args.hf_zmq_port,
+                # Generation configuration
+                repetition_penalty=self.repetition_penalty,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                min_p=self.min_p,
+                max_completion_length=self.max_completion_length,
+                logprobs=0,
+                generation_kwargs=args.generation_kwargs,
+                # Chat/tool configuration
+                chat_template=self.chat_template,
+                chat_template_kwargs=self.chat_template_kwargs,
+                tools=self.tools,
+            )
+            self._last_loaded_step = -1
+        elif self.use_vllm:
             # Initialize vLLM generation backend
             self.vllm_generation = VLLMGeneration(
                 model=self.model,
@@ -745,6 +778,13 @@ class GRPOTrainer(_BaseTrainer):
                 tools=self.tools,
             )
             self._last_loaded_step = -1  # tag to avoid useless loading during grad accumulation
+
+            # Check if weight sync is disabled via environment variable
+            if os.environ.get("DISABLE_WEIGHT_SYNC", "0") == "1":
+                logger.warning(
+                    "⚠️  vLLM weight synchronization is DISABLED via DISABLE_WEIGHT_SYNC environment variable. "
+                    "The vLLM server will use frozen weights and NOT receive training updates."
+                )
         else:
             generation_kwargs = {
                 "max_new_tokens": self.max_completion_length,
@@ -988,15 +1028,16 @@ class GRPOTrainer(_BaseTrainer):
                 Boolean mask of shape (batch_size, seq_len), where `True` indicates tokens with entropy >= threshold
                 and `False` otherwise.
         """
-        local = entropies[mask.bool()].float()
+        # Move to CPU for dynamic-shape ops to avoid NEFF recompilations on Neuron
+        local = entropies.cpu()[mask.bool().cpu()].float()
 
         # Use a negative pad_value as a sentinel because entropy values are always >= 0.
         # This guarantees that the sentinel cannot collide with any real entropy value.
         pad_value = -1e9
 
         # Pad across processes so that every rank has the same tensor length
-        padded = self.accelerator.pad_across_processes(local, dim=0, pad_index=pad_value)
-        gathered = self.accelerator.gather(padded)
+        padded = self.accelerator.pad_across_processes(local.to(entropies.device), dim=0, pad_index=pad_value)
+        gathered = self.accelerator.gather(padded).cpu()
 
         # Drop sentinel values (safe because no entropy can be negative)
         gathered = gathered[gathered != pad_value]
@@ -1004,7 +1045,7 @@ class GRPOTrainer(_BaseTrainer):
         if gathered.numel() == 0:
             return torch.zeros_like(entropies, dtype=torch.bool)
 
-        entropy_threshold = torch.quantile(gathered, threshold)
+        entropy_threshold = torch.quantile(gathered, threshold).to(entropies.device)
         masked_entropies = entropies * mask.float()
         entropy_mask = masked_entropies >= entropy_threshold
         return entropy_mask & mask.bool()  # ensure padding tokens are always masked out
@@ -1088,6 +1129,10 @@ class GRPOTrainer(_BaseTrainer):
     def training_step(self, model, inputs, num_items_in_batch):
         time_before = time.perf_counter()
         output = super().training_step(model, inputs, num_items_in_batch)
+        # Memory profiling: capture after backward pass (backward completes in super().training_step)
+        if hasattr(self, 'memory_profiler') and self.memory_profiler:
+            # Use state.global_step for consistent step numbering
+            self.memory_profiler.checkpoint("after_backward", step=self.state.global_step)
         self._step += 1
         time_after = time.perf_counter()
         self._current_train_step_time += time_after - time_before
@@ -1121,6 +1166,10 @@ class GRPOTrainer(_BaseTrainer):
                 generation_batch = shuffle_sequence_dict(generation_batch)
                 generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
                 self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
+                # Memory profiling: capture after rollout
+                if hasattr(self, 'memory_profiler') and self.memory_profiler:
+                    # Use state.global_step for consistent step numbering
+                    self.memory_profiler.checkpoint("after_rollout", step=self.state.global_step)
             inputs = self._buffered_inputs[self._step % self.args.steps_per_generation]
         else:
             # In evaluation, there is neither batch grouping for generation, nor multiple iterations, hence
@@ -1217,10 +1266,20 @@ class GRPOTrainer(_BaseTrainer):
         mode = "train" if self.model.training else "eval"
 
         if self.rollout_func is not None:
-            # Keep vLLM weights in sync for custom rollouts that rely on vLLM utilities.
-            if self.use_vllm and self.state.global_step != self._last_loaded_step:
+            # Keep weights in sync for custom rollouts that rely on vLLM utilities.
+            # Can be disabled by setting DISABLE_WEIGHT_SYNC=1 environment variable
+            disable_sync = os.environ.get("DISABLE_WEIGHT_SYNC", "0") == "1"
+            if self.use_vllm and self.state.global_step != self._last_loaded_step and not disable_sync:
+                self.accelerator.wait_for_everyone()
                 with profiling_context(self, "sync_weights"):
                     self.vllm_generation.sync_weights()
+                self.accelerator.wait_for_everyone()
+                self._last_loaded_step = self.state.global_step
+            elif self.use_hf and self.state.global_step != self._last_loaded_step and not disable_sync:
+                self.accelerator.wait_for_everyone()
+                with profiling_context(self, "sync_weights"):
+                    self.hf_generation.sync_weights()
+                self.accelerator.wait_for_everyone()
                 self._last_loaded_step = self.state.global_step
 
             # Pass prompts to rollout_func preserving structured messages.
@@ -1235,12 +1294,33 @@ class GRPOTrainer(_BaseTrainer):
             extra_fields = {k: v for k, v in output.items() if k not in required_keys}
             return output["prompt_ids"], output["completion_ids"], output["logprobs"], extra_fields
 
-        # Generate completions using either vLLM or regular generation
-        if self.use_vllm:
+        # Generate completions using HF serve-mode, vLLM, or regular generation
+        if self.use_hf:
             # Sync weights if training step changed
-            if self.state.global_step != self._last_loaded_step:
+            disable_sync = os.environ.get("DISABLE_WEIGHT_SYNC", "0") == "1"
+            if self.state.global_step != self._last_loaded_step and not disable_sync:
+                self.accelerator.wait_for_everyone()
+                with profiling_context(self, "sync_weights"):
+                    self.hf_generation.sync_weights()
+                self.accelerator.wait_for_everyone()
+                self._last_loaded_step = self.state.global_step
+
+            num_generations = self.num_generations if mode == "train" else self.num_generations_eval
+            prompt_ids, completion_ids, logprobs, _, extra_fields = self.hf_generation.generate(
+                prompts=prompts, num_generations=num_generations, profiler=profiling_context(self, "HF.generate")
+            )
+            # HF server returns per-token top-k logprobs; keep only the top-1 (sampled token) logprob
+            logprobs = [[lp[0] for lp in seq] for seq in logprobs]
+
+        elif self.use_vllm:
+            # Sync weights if training step changed
+            # Can be disabled by setting DISABLE_WEIGHT_SYNC=1 environment variable
+            disable_sync = os.environ.get("DISABLE_WEIGHT_SYNC", "0") == "1"
+            if self.state.global_step != self._last_loaded_step and not disable_sync:
+                self.accelerator.wait_for_everyone()
                 with profiling_context(self, "sync_weights"):
                     self.vllm_generation.sync_weights()
+                self.accelerator.wait_for_everyone()
                 self._last_loaded_step = self.state.global_step
 
             # Generate using vLLM
@@ -1292,7 +1372,6 @@ class GRPOTrainer(_BaseTrainer):
             extra_fields = {}  # No extra fields for paged mode
 
         else:
-            # Regular generation path
             if is_conversational({"prompt": prompts[0]}):
                 generate_inputs = self.processing_class.apply_chat_template(
                     conversation=prompts,
@@ -1324,6 +1403,7 @@ class GRPOTrainer(_BaseTrainer):
                 FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
             ):
                 prompt_completion_ids = unwrapped_model.generate(
+                    # **generate_inputs, generation_config=self.generation_config, disable_compile=True, synced_gpus=True
                     **generate_inputs, generation_config=self.generation_config, disable_compile=True
                 )
             # Compute prompt length and extract completion ids
@@ -1579,9 +1659,10 @@ class GRPOTrainer(_BaseTrainer):
         is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids], device=device)
         agg_is_truncated = self.accelerator.gather(is_truncated)
         self._metrics[mode]["completions/clipped_ratio"].append(agg_is_truncated.float().mean().item())
-        term_completion_lengths = agg_completion_lengths[~agg_is_truncated]
+        # Move to CPU for dynamic-shape boolean indexing to avoid NEFF recompilations on Neuron
+        term_completion_lengths = agg_completion_lengths.cpu()[~agg_is_truncated.cpu()]
         if len(term_completion_lengths) == 0:  # edge case where no terminated sequences are found
-            term_completion_lengths = torch.zeros(1, device=device)
+            term_completion_lengths = torch.zeros(1)
         self._metrics[mode]["completions/mean_terminated_length"].append(term_completion_lengths.float().mean().item())
         self._metrics[mode]["completions/min_terminated_length"].append(term_completion_lengths.float().min().item())
         self._metrics[mode]["completions/max_terminated_length"].append(term_completion_lengths.float().max().item())
@@ -1920,10 +2001,12 @@ class GRPOTrainer(_BaseTrainer):
         advantages = advantages[process_slice]
 
         # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
+        # Move to CPU to avoid dynamic-shape NEFF compilations from nanmean/nanstd on Neuron
+        rewards_per_func_cpu = rewards_per_func.cpu()
         for i, reward_func_name in enumerate(self.reward_func_names):
-            mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
+            mean_rewards = torch.nanmean(rewards_per_func_cpu[:, i]).item()
             self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
-            std_func_rewards = nanstd(rewards_per_func[:, i]).item()
+            std_func_rewards = nanstd(rewards_per_func_cpu[:, i]).item()
             self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_func_rewards)
         rewards = rewards_per_func.nansum(dim=1)
         self._metrics[mode]["reward"].append(rewards.mean().item())
@@ -1941,39 +2024,40 @@ class GRPOTrainer(_BaseTrainer):
             self._logs["images"].extend(gather_object(images))
 
         if self.use_vllm and self.vllm_importance_sampling_correction:
-            delta = torch.abs(old_per_token_logps - sampling_per_token_logps)
-            mask = completion_mask.bool() if tool_mask is None else (completion_mask * tool_mask).bool()
-            delta = delta[mask]
-            mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
-            max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
+            # Move to CPU for metric computation to avoid dynamic-shape NEFF compilations on Neuron
+            delta_cpu = torch.abs(old_per_token_logps - sampling_per_token_logps).cpu()
+            mask_cpu = (completion_mask.bool() if tool_mask is None else (completion_mask * tool_mask).bool()).cpu()
+            delta_cpu = delta_cpu[mask_cpu]
+            mean_delta = torch.mean(delta_cpu) if delta_cpu.numel() > 0 else torch.tensor(0.0)
+            max_delta = torch.max(delta_cpu) if delta_cpu.numel() > 0 else torch.tensor(0.0)
             self._metrics[mode]["sampling/sampling_logp_difference/mean"].append(
-                self.accelerator.gather(mean_delta).mean().item()
+                self.accelerator.gather(mean_delta.to(device)).mean().item()
             )
             self._metrics[mode]["sampling/sampling_logp_difference/max"].append(
-                self.accelerator.gather(max_delta).max().item()
+                self.accelerator.gather(max_delta.to(device)).max().item()
             )
             if sequence_level_is:
-                flat_is_ratio = vllm_importance_sampling_ratio.flatten()
+                flat_is_ratio_cpu = vllm_importance_sampling_ratio.flatten().cpu()
             else:
-                flat_is_ratio = vllm_importance_sampling_ratio[mask]
+                flat_is_ratio_cpu = vllm_importance_sampling_ratio.cpu()[mask_cpu]
 
             min_importance_sampling_ratio = (
-                torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+                torch.min(flat_is_ratio_cpu) if flat_is_ratio_cpu.numel() > 0 else torch.tensor(0.0)
             )
             mean_importance_sampling_ratio = (
-                torch.mean(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+                torch.mean(flat_is_ratio_cpu) if flat_is_ratio_cpu.numel() > 0 else torch.tensor(0.0)
             )
             max_importance_sampling_ratio = (
-                torch.max(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+                torch.max(flat_is_ratio_cpu) if flat_is_ratio_cpu.numel() > 0 else torch.tensor(0.0)
             )
             self._metrics[mode]["sampling/importance_sampling_ratio/min"].append(
-                nanmin(self.accelerator.gather(min_importance_sampling_ratio)).item()
+                nanmin(self.accelerator.gather(min_importance_sampling_ratio.to(device))).item()
             )
             self._metrics[mode]["sampling/importance_sampling_ratio/mean"].append(
-                self.accelerator.gather(mean_importance_sampling_ratio).nanmean().item()
+                self.accelerator.gather(mean_importance_sampling_ratio.to(device)).nanmean().item()
             )
             self._metrics[mode]["sampling/importance_sampling_ratio/max"].append(
-                nanmax(self.accelerator.gather(max_importance_sampling_ratio)).item()
+                nanmax(self.accelerator.gather(max_importance_sampling_ratio.to(device))).item()
             )
 
         output = {
@@ -2230,6 +2314,12 @@ class GRPOTrainer(_BaseTrainer):
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
 
+        # Memory profiling: capture after forward pass
+        if hasattr(self, 'memory_profiler') and self.memory_profiler:
+            # Use state.global_step for consistent step numbering
+            self.memory_profiler.checkpoint("after_forward", step=self.state.global_step)
+
+        # return loss
         # Log the metrics
         completion_token_count = mask.sum().clamp(min=1.0)
 
@@ -2357,3 +2447,55 @@ class GRPOTrainer(_BaseTrainer):
             model_name = self.args.hub_model_id.split("/")[-1]
         self.create_model_card(model_name=model_name)
         super()._save_checkpoint(model, trial)
+
+    def save_model(self, output_dir=None, _internal_call=False):
+        """Override save_model to handle FSDP2 + PEFT checkpoint saving."""
+        if output_dir is None:
+            output_dir = self.args.output_dir
+
+        if self.is_fsdp_enabled and is_peft_model(self.model):
+            import torch.distributed as dist
+            import os
+
+            # Use accelerator.get_state_dict which properly handles FSDP2
+            # This is a collective operation - all ranks participate
+            # It will gather the full state dict on rank 0 based on FSDP config
+            state_dict = self.accelerator.get_state_dict(self.model)
+
+            # Only rank 0 saves the model
+            if self.args.should_save:
+                os.makedirs(output_dir, exist_ok=True)
+                logger.info(f"Saving model checkpoint to {output_dir}")
+
+                # Extract only adapter parameters (lora_A, lora_B, etc.)
+                # Filter keys that contain 'lora' (case-insensitive)
+                adapter_state_dict = {
+                    k: v for k, v in state_dict.items()
+                    if 'lora' in k.lower() or 'adapter' in k.lower()
+                }
+
+                # Save using safetensors
+                from safetensors.torch import save_file
+                save_file(adapter_state_dict, os.path.join(output_dir, "adapter_model.safetensors"))
+
+                # Save adapter config
+                self.model.peft_config[self.model.active_adapter].save_pretrained(output_dir)
+
+                # Save tokenizer/processor
+                if self.processing_class is not None:
+                    self.processing_class.save_pretrained(output_dir)
+
+                # Save training args
+                import torch
+                torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+
+            # Wait for all ranks to finish
+            if dist.is_initialized():
+                dist.barrier()
+
+            # Push to hub if needed (only from main process)
+            if self.args.push_to_hub and not _internal_call:
+                self.push_to_hub(commit_message="Model save", revision=self.args.hub_revision)
+        else:
+            # For non-FSDP or non-PEFT models, use default save logic
+            super().save_model(output_dir, _internal_call)

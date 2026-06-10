@@ -15,9 +15,10 @@
 """Generation backends for TRL trainers."""
 
 from ..import_utils import is_vllm_available
+from .hf_generation import HFGeneration
 
 
-__all__ = []
+__all__ = ["HFGeneration"]
 
 if is_vllm_available():
     from .vllm_generation import VLLMGeneration

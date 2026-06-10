@@ -14,6 +14,7 @@
 
 from .base import Command
 from .env import EnvCommand
+from .hf_serve import HfServeCommand
 from .skills import SkillsCommand
 from .training import TrainingCommand
 from .vllm_serve import VllmServeCommand
@@ -25,6 +26,7 @@ def get_commands() -> list[Command]:
         TrainingCommand("dpo"),
         EnvCommand(),
         TrainingCommand("grpo"),
+        HfServeCommand(),
         TrainingCommand("kto"),
         TrainingCommand("reward"),
         TrainingCommand("rloo"),

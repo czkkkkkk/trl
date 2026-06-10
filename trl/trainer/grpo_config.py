@@ -570,6 +570,44 @@ class GRPOConfig(_BaseConfig):
         },
     )
 
+    # Parameters that control HF serve-mode rollout (separate-process HF
+    # transformers `.generate()` with torch.compile, HTTP + ZMQ weight sync)
+    use_hf: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to use an HF serve-mode rollout server for generating completions. If set to `True`, the "
+            "trainer will use a separate-process HF transformers server for generation and weight sync via ZMQ. "
+            "Mutually exclusive with `use_vllm`."
+        },
+    )
+    hf_server_base_url: str | None = field(
+        default=None,
+        metadata={
+            "help": "Base URL for the HF serve-mode server (e.g., 'http://localhost:30000'). If provided, "
+            "`hf_server_host` and `hf_server_port` are ignored."
+        },
+    )
+    hf_server_host: str = field(
+        default="0.0.0.0",
+        metadata={"help": "Host of the HF serve-mode server. Ignored if hf_server_base_url is provided."},
+    )
+    hf_server_port: int = field(
+        default=30000,
+        metadata={"help": "Port of the HF serve-mode server. Ignored if hf_server_base_url is provided."},
+    )
+    hf_server_timeout: float = field(
+        default=240.0,
+        metadata={
+            "help": "Total timeout duration in seconds to wait for the HF serve-mode server to be up."
+        },
+    )
+    hf_zmq_port: int = field(
+        default=5558,
+        metadata={
+            "help": "Port number for ZMQ weight sync communication with the HF serve-mode server.",
+        },
+    )
+
     # Parameters that control the training
     beta: float = field(
         default=0.0,
