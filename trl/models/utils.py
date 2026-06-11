@@ -24,6 +24,7 @@ import torch.nn as nn
 import transformers
 from accelerate import Accelerator
 from packaging.version import Version
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 from transformers import GenerationConfig, PreTrainedModel
@@ -136,9 +137,174 @@ def _unwrap_model_for_generation(
                 yield accelerator.unwrap_model(model)
                 add_hooks(model)
     else:
-        yield unwrapped_model
+        with _fsdp2_unshard_for_generation(model):
+            yield unwrapped_model
     if is_gradient_checkpointing:
         unwrapped_model.gradient_checkpointing_enable()
+
+
+@contextmanager
+def _fsdp2_unshard_for_generation(model):
+    """
+    Context manager that keeps FSDP2-managed parameters unsharded for the
+    duration of generation, then reshards on exit.
+
+    With the default ``reshard_after_forward=True`` each decode step triggers
+    a per-layer all-gather via FSDP2's pre-forward hook. For long rollouts
+    this dominates wall time. Disabling reshard-after-forward and unsharding
+    once keeps the first decode step paying the gather cost and lets every
+    subsequent step run with zero collectives.
+
+    Memory cost: each rank holds the full unsharded weights for the rollout.
+
+    Also temporarily detaches FSDP2's forward pre/post hooks. Those hooks are
+    wrapped in ``torch._dynamo.disable`` (via ``skip_fsdp_hooks``), which forces
+    a graph break at every FSDP-wrapped submodule and prevents
+    ``torch.compile(..., fullgraph=True)``. Since the params are already
+    gathered for the whole rollout, the hooks would just early-return anyway.
+
+    No-op if no submodule is an ``FSDPModule`` (FSDP1 or non-FSDP models).
+    """
+    fsdp_modules = [m for m in model.modules() if isinstance(m, FSDPModule)]
+    if not fsdp_modules:
+        yield
+        return
+
+    for m in fsdp_modules:
+        m.set_reshard_after_forward(False, recurse=False)
+    # Root unshard; recurses via FSDP2's lazy_init/unshard path.
+    # Calling unshard on each FSDPModule explicitly guarantees all layers are
+    # gathered up front regardless of nesting.
+    for m in fsdp_modules:
+        m.unshard()
+
+    suspended_hooks = _fsdp2_suspend_forward_hooks(fsdp_modules)
+    bypassed_ckpt = _bypass_activation_checkpointing(model)
+    swapped_forward = _swap_in_rollout_forward(model)
+    try:
+        yield
+    finally:
+        _swap_out_rollout_forward(swapped_forward)
+        _restore_activation_checkpointing(bypassed_ckpt)
+        _fsdp2_restore_forward_hooks(suspended_hooks)
+        for m in fsdp_modules:
+            m.reshard()
+            m.set_reshard_after_forward(True, recurse=False)
+
+
+def _swap_in_rollout_forward(model):
+    """If the model has a ``_rollout_forward`` attribute (e.g. a precompiled
+    forward for generation), swap it in for the duration of the rollout.
+
+    Lets the caller compile ``forward`` for rollout without subjecting the
+    training-time forward to the same compile (which would hit FSDP2 hook
+    graph breaks under ``fullgraph=True``).
+
+    Returns a (model, original_forward) tuple or ``None`` if no swap happened.
+    """
+    rollout_forward = getattr(model, "_rollout_forward", None)
+    if rollout_forward is None:
+        return None
+    original_forward = model.forward
+    model.forward = rollout_forward
+    return (model, original_forward)
+
+
+def _swap_out_rollout_forward(state):
+    if state is None:
+        return
+    model, original_forward = state
+    model.forward = original_forward
+
+
+def _bypass_activation_checkpointing(model):
+    """Make every ``CheckpointWrapper`` a pass-through for the rollout.
+
+    Rollout runs under ``torch.no_grad()``, so the checkpoint's recompute path
+    is dead weight. Dynamo also refuses to trace ``torch.utils.checkpoint``
+    when the wrapped forward mutates an outer object (e.g. the static KV
+    cache's ``StaticLayer``), which blocks ``fullgraph=True``.
+
+    Shadows ``forward`` on each wrapper with a bound call to the inner module,
+    so the checkpoint HOP disappears from the traced graph entirely.
+    """
+    bypassed = []
+    for m in model.modules():
+        if isinstance(m, CheckpointWrapper):
+            m.forward = m._checkpoint_wrapped_module.__call__
+            bypassed.append(m)
+    return bypassed
+
+
+def _restore_activation_checkpointing(bypassed):
+    # Dropping the instance attribute lets CheckpointWrapper.forward (the class
+    # method) take over again for the next training step.
+    for wrapper in bypassed:
+        try:
+            del wrapper.forward
+        except AttributeError:
+            pass
+
+
+def _fsdp2_suspend_forward_hooks(fsdp_modules):
+    """Remove FSDP2's dynamo-disabled forward hooks so torch.compile can see
+    the full graph. Returns state needed by ``_fsdp2_restore_forward_hooks``.
+
+    Walks each ``FSDPState`` (one per ``fully_shard`` call), removes its
+    ``_pre_forward_hook_handle`` / ``_post_forward_hook_handle``, and records
+    the modules the hooks were registered on so they can be re-registered with
+    the same semantics on context exit.
+    """
+    from torch.distributed.fsdp._fully_shard._fsdp_state import (
+        _get_module_fsdp_state,
+        _register_group_forward_hooks,
+    )
+
+    suspended = []
+    seen_states = set()
+    for m in fsdp_modules:
+        state = _get_module_fsdp_state(m)
+        if state is None or id(state) in seen_states:
+            continue
+        seen_states.add(id(state))
+        pre_handle = getattr(state, "_pre_forward_hook_handle", None)
+        post_handle = getattr(state, "_post_forward_hook_handle", None)
+        if pre_handle is None or post_handle is None:
+            continue
+        pre_handle.remove()
+        # Multi-module states use one _MultiHandle for both pre and post;
+        # only call remove() once in that case.
+        if post_handle is not pre_handle:
+            post_handle.remove()
+        suspended.append((state, tuple(state._modules)))
+
+    # Avoid closing over the import in the restore function.
+    return {
+        "suspended": suspended,
+        "_register_group_forward_hooks": _register_group_forward_hooks,
+    }
+
+
+def _fsdp2_restore_forward_hooks(suspended_state):
+    """Re-register the FSDP2 forward hooks removed by the suspend helper."""
+    _register_group_forward_hooks = suspended_state["_register_group_forward_hooks"]
+    for state, modules in suspended_state["suspended"]:
+        if len(modules) == 1:
+            state._pre_forward_hook_handle = modules[0].register_forward_pre_hook(
+                state._pre_forward, prepend=True, with_kwargs=True
+            )
+            state._post_forward_hook_handle = modules[0].register_forward_hook(
+                state._post_forward, prepend=False
+            )
+        else:
+            hook_handle = _register_group_forward_hooks(
+                modules,
+                state._pre_forward,
+                state._post_forward,
+                state._modules_to_run_forward,
+            )
+            state._pre_forward_hook_handle = hook_handle
+            state._post_forward_hook_handle = hook_handle
 
 
 @contextmanager
@@ -295,15 +461,28 @@ def prepare_fsdp(model, accelerator: Accelerator) -> FSDP | FSDPModule:
                     "handling of ignored modules. Please upgrade accelerate to v1.11.0 or later for proper support."
                 )
                 ignored_params = None
-            fully_shard(
-                model,
-                reshard_after_forward=fsdp_plugin.reshard_after_forward,
-                offload_policy=fsdp_plugin.cpu_offload,
+            fsdp2_kwargs = {
+                "reshard_after_forward": fsdp_plugin.reshard_after_forward,
+                "offload_policy": fsdp_plugin.cpu_offload,
                 # `fully_shard` doesn't accept `None` in case of `MixedPrecisionPolicy`
-                mp_policy=fsdp_plugin.mixed_precision_policy or MixedPrecisionPolicy(),
-                mesh=mesh[tuple(accelerator.parallelism_config.fsdp_dim_names)] if mesh is not None else None,
-                ignored_params=ignored_params,
-            )
+                "mp_policy": fsdp_plugin.mixed_precision_policy or MixedPrecisionPolicy(),
+                "mesh": mesh[tuple(accelerator.parallelism_config.fsdp_dim_names)] if mesh is not None else None,
+                "ignored_params": ignored_params,
+            }
+            # Per-layer wrapping to match accelerate's fsdp2_prepare_model behavior.
+            # Without this, all params end up in a single FSDP group, causing a massive
+            # all-gather that triggers many aten::contiguous compilations on Neuron.
+            from accelerate.utils.fsdp_utils import fsdp2_prepare_auto_wrap_policy
+            from accelerate.utils.other import get_module_children_bottom_up
+
+            fsdp_plugin.set_auto_wrap_policy(model)
+            auto_wrap_policy_func = fsdp2_prepare_auto_wrap_policy(fsdp_plugin, model)
+            if auto_wrap_policy_func is not None:
+                all_modules = get_module_children_bottom_up(model)[:-1]
+                for module in all_modules:
+                    if auto_wrap_policy_func(module) and not isinstance(module, FSDPModule):
+                        fully_shard(module, **fsdp2_kwargs)
+            fully_shard(model, **fsdp2_kwargs)
         else:
             raise ValueError(f"FSDP version {fsdp_plugin.fsdp_version} is not supported.")
     model.eval()
