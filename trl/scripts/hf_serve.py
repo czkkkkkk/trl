@@ -18,7 +18,8 @@ Architecture
 ------------
 Rank 0 (the main process) runs FastAPI + ZMQ. It spawns ``--world-size N``
 worker processes; each worker holds a full ``AutoModelForCausalLM`` on its
-own slice of Neuron cores and runs ``model.generate()`` under
+own slice of Neuron cores and runs a manual chunked-prefill / decode loop
+with a ``StaticCache``, calling ``model.forward`` compiled under
 ``torch.compile(backend="neuron")``.
 
 - ``POST /generate`` shards prompts round-robin across workers, collects their
@@ -29,10 +30,25 @@ own slice of Neuron cores and runs ``model.generate()`` under
 
 Fixed-shape contract (for torch.compile on Neuron)
 --------------------------------------------------
-Each worker tokenizes with ``padding="max_length"``, ``max_length =
---max-prompt-length``, so the prefill graph compiled on the first request is
-reusable for every subsequent batch. Weight updates go in place, preserving
-the compiled graph's captured tensor pointers.
+Instead of ``model.generate()``, each worker runs explicit prefill and decode
+loops so every compiled forward sees the same shapes:
+
+* prefill chunk:  ``input_ids [B, prefill_chunk_size]``, ``position_ids [B, prefill_chunk_size]``
+* decode step:    ``input_ids [B, 1]``, ``position_ids [B, 1]``
+* attention_mask: fixed ``[B, max_prompt_length + max_new_tokens]`` 2D mask
+  (zeros on left padding, ones everywhere else; not-yet-written cache slots
+  are hidden by the causal mask, so the mask never grows)
+
+The prompt-pad length is rounded up to ``lcm(pad_to_multiple,
+prefill_chunk_size)`` so prefill always splits into whole chunks, and the
+``StaticCache`` is allocated once per batch size at the full
+``max_prompt_length + max_new_tokens`` window, so the same prefill/decode
+graphs serve every request. Sampling runs on device (compiled Gumbel-max)
+when only temperature is needed; requests using ``top_p`` / ``top_k`` /
+``min_p`` / ``repetition_penalty`` or ``return_logprob`` sample on CPU with
+the standard HF logits processors. Generated tokens accumulate on CPU; only
+the static-shape per-step inputs touch the Neuron device. Weight updates go
+in place, preserving the compiled graph's captured tensor pointers.
 
 Neuron core slicing
 -------------------
@@ -49,6 +65,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import logging
+import math
 import os
 import threading
 import time
@@ -59,7 +76,6 @@ from typing import Any
 
 import torch
 import torch.multiprocessing as mp
-import torch.nn.functional as F
 
 from trl import TrlParser
 from trl.import_utils import (
@@ -160,11 +176,17 @@ class ScriptArguments:
             Torch device to place the model on.
         max_prompt_length (`int`, *optional*, defaults to `512`):
             Maximum prompt length for tokenization (used as `max_length` with truncation).
+        max_new_tokens (`int`, *optional*, defaults to `512`):
+            Maximum number of new tokens any request may generate. The static KV cache is
+            allocated at `max_prompt_length + max_new_tokens`; longer requests get HTTP 400.
         pad_to_multiple (`int`, *optional*, defaults to `128`):
             Round each request's prompt-pad length up to this multiple (capped at
             `--max-prompt-length`). Use 1 to disable bucketing.
+        prefill_chunk_size (`int`, *optional*, defaults to `128`):
+            Prompt tokens are prefilled in fixed chunks of this size so the prefill graph
+            is compiled once.
         cache_implementation (`str`, *optional*, defaults to `"static"`):
-            Default `cache_implementation` passed to `GenerationConfig`.
+            Deprecated and ignored: the manual decode loop always uses a `StaticCache`.
         world_size (`int`, *optional*, defaults to `1`):
             Number of data-parallel worker processes. Each worker gets an equal slice
             of `NEURON_RT_VISIBLE_CORES`.
@@ -195,6 +217,14 @@ class ScriptArguments:
         default=512,
         metadata={"help": "Maximum prompt length for tokenization."},
     )
+    max_new_tokens: int = field(
+        default=512,
+        metadata={
+            "help": "Maximum number of new tokens any request may generate. The static KV "
+            "cache is allocated once at max_prompt_length + max_new_tokens; requests "
+            "asking for more are rejected with HTTP 400."
+        },
+    )
     pad_to_multiple: int = field(
         default=128,
         metadata={
@@ -202,9 +232,20 @@ class ScriptArguments:
             "(capped at --max-prompt-length). Use 1 to disable bucketing."
         },
     )
+    prefill_chunk_size: int = field(
+        default=128,
+        metadata={
+            "help": "Prompt tokens are prefilled in fixed chunks of this size so the "
+            "prefill graph is compiled once. --max-prompt-length must be a multiple of "
+            "lcm(--pad-to-multiple, --prefill-chunk-size)."
+        },
+    )
     cache_implementation: str = field(
         default="static",
-        metadata={"help": "Default `cache_implementation` passed to `GenerationConfig`."},
+        metadata={
+            "help": "Deprecated and ignored: the manual decode loop always uses a "
+            "`StaticCache`. Kept for CLI compatibility."
+        },
     )
     world_size: int = field(
         default=1,
@@ -245,103 +286,298 @@ if is_pydantic_available():
 # ---------------------------------------------------------------------------
 
 
-@torch.inference_mode()
-def _worker_generate(model, tokenizer, device, args: ScriptArguments, indexed_prompts, gen_args):
-    """Run ``model.generate()`` on one shard; return list of per-completion dicts.
+def _gumbel_max_sample(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Sample one token per sequence from the last-position logits [B, vocab].
 
-    Mirrors ``trl/trainer/grpo_trainer.py`` colocate path (L1430-1489):
-    left-pad with ``pad_to_multiple_of``, ``GenerationConfig`` includes
-    ``bos_token_id``, and completion masking uses the first-EOS index
-    (not ``== pad_id``).
+    Gumbel-max: argmax(logits/T + g), g ~ Gumbel(0,1), is equivalent to
+    multinomial sampling from softmax(logits/T). Both the noise and the argmax
+    run on device; only the [B] token ids leave it.
     """
-    from transformers import GenerationConfig
+    scaled = logits.float() / temperature
+    gumbel = -torch.log(-torch.log(torch.rand_like(scaled).clamp_min(1e-20)))
+    return torch.argmax(scaled + gumbel, dim=-1)
+
+
+def _gumbel_max_sample_with_logprob(
+    logits: torch.Tensor, temperature: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Like ``_gumbel_max_sample`` but also returns the sampled tokens' logprobs [B]."""
+    scaled = logits.float() / temperature
+    gumbel = -torch.log(-torch.log(torch.rand_like(scaled).clamp_min(1e-20)))
+    next_tokens = torch.argmax(scaled + gumbel, dim=-1)
+    logprobs = torch.log_softmax(scaled, dim=-1)
+    token_logprobs = logprobs.gather(-1, next_tokens.unsqueeze(-1)).squeeze(-1)
+    return next_tokens, token_logprobs
+
+
+def _device_sampling_supported(gen_args: dict) -> bool:
+    """The compiled Gumbel-max sampler only implements temperature scaling."""
+    return (
+        gen_args["repetition_penalty"] == 1.0
+        and gen_args["top_p"] >= 1.0
+        and gen_args["top_k"] == 0
+        and gen_args["min_p"] == 0.0
+    )
+
+
+def _build_logits_processors(gen_args: dict):
+    """CPU fallback sampling pipeline; same processor order as ``model.generate()``."""
+    from transformers.generation.logits_process import (
+        LogitsProcessorList,
+        MinPLogitsWarper,
+        RepetitionPenaltyLogitsProcessor,
+        TemperatureLogitsWarper,
+        TopKLogitsWarper,
+        TopPLogitsWarper,
+    )
+
+    processors = LogitsProcessorList()
+    if gen_args["repetition_penalty"] != 1.0:
+        processors.append(RepetitionPenaltyLogitsProcessor(penalty=gen_args["repetition_penalty"]))
+    if gen_args["temperature"] != 1.0:
+        processors.append(TemperatureLogitsWarper(gen_args["temperature"]))
+    if gen_args["top_k"] > 0:
+        processors.append(TopKLogitsWarper(top_k=gen_args["top_k"]))
+    if gen_args["top_p"] < 1.0:
+        processors.append(TopPLogitsWarper(top_p=gen_args["top_p"]))
+    if gen_args["min_p"] > 0.0:
+        processors.append(MinPLogitsWarper(min_p=gen_args["min_p"]))
+    return processors
+
+
+class _WorkerEngine:
+    """Per-worker inference state: compiled forward/sampler graphs and static caches.
+
+    ``model.forward`` and the Gumbel-max samplers are compiled once
+    (``backend="neuron"``, ``dynamic=False``); the fixed-shape contract in
+    ``_worker_generate`` guarantees each is traced once for prefill and once
+    for decode. ``StaticCache`` objects are kept per batch size (a new batch
+    size triggers one new trace) and reset in place between requests so the
+    compiled graphs keep pointing at the same cache tensors.
+    """
+
+    def __init__(self, rank: int, model, tokenizer, device, args: ScriptArguments):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.device = device
+        self.args = args
+        self.max_cache_len = args.max_prompt_length + args.max_new_tokens
+        self._caches: dict[int, Any] = {}
+
+        on_neuron = (
+            device.type in ("neuron", "privateuseone") or os.environ.get("ON_NEURON") == "1"
+        )
+        self.sample_on_device = os.environ.get("SAMPLE_ON_NEURON", "1") == "1"
+
+        if on_neuron:
+            # Strip module-level backward hooks so fullgraph=True does not trip gb0083.
+            n_stripped = 0
+            for m in model.modules():
+                n_stripped += len(m._backward_hooks) + len(getattr(m, "_backward_pre_hooks", {}))
+                m._backward_hooks.clear()
+                if hasattr(m, "_backward_pre_hooks"):
+                    m._backward_pre_hooks.clear()
+            if n_stripped:
+                logger.info(f"[worker {rank}] stripped {n_stripped} module-level backward hooks")
+
+            # Every distinct request batch size traces the forward twice (one
+            # prefill graph, one decode graph). Dynamo's default recompile
+            # limit of 8 turns the 3rd-4th batch size into a hard failure under
+            # fullgraph=True, so raise it: these recompiles are expected and
+            # each is a one-time cost cached for the server's lifetime.
+            torch._dynamo.config.recompile_limit = int(
+                os.environ.get("HF_SERVE_RECOMPILE_LIMIT", "64")
+            )
+
+            fullgraph = os.environ.get("HF_SERVE_COMPILE_FULLGRAPH", "1") == "1"
+            logger.info(
+                f"[worker {rank}] compiling model.forward and samplers "
+                f"(backend='neuron', fullgraph={fullgraph}), "
+                f"sample_on_device={self.sample_on_device}"
+            )
+            self.model_forward = torch.compile(
+                model.forward, backend="neuron", fullgraph=fullgraph, dynamic=False
+            )
+            self.sample_fn = torch.compile(
+                _gumbel_max_sample, backend="neuron", fullgraph=fullgraph, dynamic=False
+            )
+            self.sample_with_logprob_fn = torch.compile(
+                _gumbel_max_sample_with_logprob, backend="neuron", fullgraph=fullgraph, dynamic=False
+            )
+        else:
+            logger.info(f"[worker {rank}] skipping torch.compile (non-Neuron device)")
+            self.model_forward = model.forward
+            self.sample_fn = _gumbel_max_sample
+            self.sample_with_logprob_fn = _gumbel_max_sample_with_logprob
+
+    def get_cache(self, batch_size: int):
+        """Return a reset ``StaticCache`` for this batch size, allocating on first use."""
+        from transformers import StaticCache
+
+        cache = self._caches.get(batch_size)
+        if cache is None:
+            cache = StaticCache(config=self.model.config, max_cache_len=self.max_cache_len)
+            self._caches[batch_size] = cache
+        else:
+            cache.reset()
+        return cache
+
+
+@torch.inference_mode()
+def _worker_generate(engine: "_WorkerEngine", args: ScriptArguments, indexed_prompts, gen_args):
+    """Run a manual chunked-prefill / decode loop on one shard; return per-completion dicts.
+
+    Replaces ``model.generate()`` with explicit prefill and decode loops so the
+    compiled forward only ever sees two shapes (see module docstring). Keeps the
+    ``trl/trainer/grpo_trainer.py`` colocate-path semantics: left padding,
+    completion masking via the first-EOS index (not ``== pad_id``), and
+    per-token logprobs of the sampled tokens under the processed distribution.
+    """
+    tokenizer = engine.tokenizer
+    device = engine.device
 
     indices = [i for i, _ in indexed_prompts]
     prompts = [p for _, p in indexed_prompts]
+    n = gen_args["n"]
+    max_new_tokens = min(gen_args["max_new_tokens"], args.max_new_tokens)
+    return_logprob = gen_args["return_logprob"]
+    temperature = gen_args["temperature"]
+
+    gen_kwargs = dict(gen_args.get("generation_kwargs") or {})
+    gen_kwargs.pop("cache_implementation", None)  # the manual loop always uses StaticCache
+    if gen_kwargs:
+        logger.warning(
+            f"Ignoring generation_kwargs not supported by the manual decode loop: {sorted(gen_kwargs)}"
+        )
 
     # Left padding so the last real prompt token sits at the same absolute
-    # position for every row. ``pad_to_multiple_of`` keeps the prefill shape
-    # stable across requests (required for torch.compile on Neuron). Capped
+    # position for every row. The pad length is rounded up to
+    # lcm(pad_to_multiple, prefill_chunk_size) so prefill always splits into
+    # whole fixed-size chunks (required for torch.compile on Neuron). Capped
     # at ``--max-prompt-length`` via ``max_length`` + ``truncation=True``.
+    pad_unit = math.lcm(max(args.pad_to_multiple, 1), args.prefill_chunk_size)
     tokenizer.padding_side = "left"
     encoded = tokenizer(
         text=prompts,
         padding=True,
         padding_side="left",
-        pad_to_multiple_of=args.pad_to_multiple,
+        pad_to_multiple_of=pad_unit,
         max_length=args.max_prompt_length,
         truncation=True,
         return_tensors="pt",
     )
-    input_ids = encoded["input_ids"].to(device)
-    attention_mask = encoded["attention_mask"].to(device)
+    input_ids = encoded["input_ids"].repeat_interleave(n, dim=0)
+    prompt_mask = encoded["attention_mask"].repeat_interleave(n, dim=0)
+    batch_size, prompt_len = input_ids.shape
 
-    gen_kwargs = dict(gen_args.get("generation_kwargs") or {})
-    cache_implementation = gen_kwargs.pop("cache_implementation", args.cache_implementation)
+    # Fixed 2D mask covering the whole static cache: zeros on the left padding,
+    # ones for the prompt and all future decode slots. Cache slots that are not
+    # written yet are masked by the causal mask, so this never has to grow.
+    attention_mask_cpu = torch.ones(batch_size, engine.max_cache_len, dtype=torch.long)
+    attention_mask_cpu[:, :prompt_len] = prompt_mask
+    # Positions for the full window: padding tokens get 0, real tokens count up.
+    position_ids_full = (attention_mask_cpu.cumsum(-1) - 1).clamp(min=0)
+    attention_mask = attention_mask_cpu.to(device)
+    input_ids_dev = input_ids.to(device)
 
-    gen_config = GenerationConfig(
-        do_sample=True,
-        num_return_sequences=gen_args["n"],
-        temperature=gen_args["temperature"],
-        top_p=gen_args["top_p"],
-        top_k=gen_args["top_k"] if gen_args["top_k"] > 0 else 0,
-        min_p=gen_args["min_p"],
-        repetition_penalty=gen_args["repetition_penalty"],
-        max_new_tokens=gen_args["max_new_tokens"],
-        cache_implementation=cache_implementation,
-        output_scores=gen_args["return_logprob"],
-        return_dict_in_generate=True,
-        pad_token_id=tokenizer.pad_token_id,
-        bos_token_id=tokenizer.bos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        **gen_kwargs,
+    cache = engine.get_cache(batch_size)
+
+    use_device_sampling = engine.sample_on_device and _device_sampling_supported(gen_args)
+    processors = None if use_device_sampling else _build_logits_processors(gen_args)
+    # Repetition penalty needs the full token history; only track it when sampling on CPU.
+    all_ids_cpu = input_ids if processors is not None else None
+
+    eos_token_id = tokenizer.eos_token_id
+    eos_ids = torch.tensor([eos_token_id] if isinstance(eos_token_id, int) else eos_token_id)
+    pad_id = tokenizer.pad_token_id
+
+    # ---- Chunked prefill: feed the prompt prefill_chunk_size tokens at a time ----
+    for chunk_start in range(0, prompt_len, args.prefill_chunk_size):
+        chunk_end = chunk_start + args.prefill_chunk_size
+        outputs = engine.model_forward(
+            input_ids=input_ids_dev[:, chunk_start:chunk_end],
+            attention_mask=attention_mask,
+            position_ids=position_ids_full[:, chunk_start:chunk_end].to(device),
+            past_key_values=cache,
+            use_cache=True,
+            logits_to_keep=1,
+        )
+
+    # ---- Decode: one token per step, all shapes static ----
+    generated_steps: list[torch.Tensor] = []  # per-step [B] CPU tensors
+    logprob_steps: list[torch.Tensor] = []
+    unfinished = torch.ones(batch_size, dtype=torch.bool)
+    for step in range(max_new_tokens):
+        last_logits = outputs.logits[:, -1, :]
+        if use_device_sampling:
+            if return_logprob:
+                next_tokens, step_lp = engine.sample_with_logprob_fn(last_logits, temperature)
+                next_tokens = next_tokens.to("cpu")
+                logprob_steps.append(step_lp.to("cpu"))
+            else:
+                next_tokens = engine.sample_fn(last_logits, temperature).to("cpu")
+        else:
+            scores = processors(all_ids_cpu, last_logits.to("cpu").float())
+            next_tokens = torch.multinomial(torch.softmax(scores, dim=-1), num_samples=1).squeeze(1)
+            if return_logprob:
+                step_lp = torch.log_softmax(scores, dim=-1).gather(
+                    -1, next_tokens.unsqueeze(-1)
+                ).squeeze(-1)
+                logprob_steps.append(step_lp)
+
+        next_tokens = torch.where(unfinished, next_tokens, torch.full_like(next_tokens, pad_id))
+        generated_steps.append(next_tokens)
+        if all_ids_cpu is not None:
+            all_ids_cpu = torch.cat([all_ids_cpu, next_tokens.unsqueeze(1)], dim=1)
+        unfinished &= ~torch.isin(next_tokens, eos_ids)
+        if not unfinished.any() or step == max_new_tokens - 1:
+            break
+
+        outputs = engine.model_forward(
+            input_ids=next_tokens.unsqueeze(1).to(device),
+            attention_mask=attention_mask,
+            position_ids=position_ids_full[:, prompt_len + step : prompt_len + step + 1].to(device),
+            past_key_values=cache,
+            use_cache=True,
+            logits_to_keep=1,
+        )
+
+    completions = (
+        torch.stack(generated_steps, dim=1)
+        if generated_steps
+        else torch.empty(batch_size, 0, dtype=torch.long)
     )
-
-    out = model.generate(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        generation_config=gen_config,
-    )
-
-    prompt_len = input_ids.shape[1]
-    sequences = out.sequences
-    completions = sequences[:, prompt_len:]
 
     # Mask everything after the first EOS.
-    eos_id = tokenizer.eos_token_id
-    is_eos = completions == eos_id
-    eos_idx = torch.full(
-        (is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device
-    )
-    eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
-    sequence_indices = torch.arange(is_eos.size(1), device=device).expand(
-        is_eos.size(0), -1
-    )
+    is_eos = torch.isin(completions, eos_ids)
+    eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long)
+    if is_eos.numel():
+        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+    sequence_indices = torch.arange(is_eos.size(1)).expand(is_eos.size(0), -1)
     completion_mask = sequence_indices <= eos_idx.unsqueeze(1)
 
     # Strip via attention_mask / completion_mask (colocate L1486-1487), not
     # token-id equality — pad_token often equals eos_token so a comparison
     # against pad_id would drop legitimate EOS tokens from the prompt.
-    prompt_ids_clean = [p[m].tolist() for p, m in zip(input_ids, attention_mask.bool())]
-    completion_ids_trimmed = [
-        c[m].tolist() for c, m in zip(completions, completion_mask)
+    prompt_ids_clean = [
+        p[m].tolist() for p, m in zip(encoded["input_ids"], encoded["attention_mask"].bool())
     ]
+    completion_ids_trimmed = [c[m].tolist() for c, m in zip(completions, completion_mask)]
 
-    if gen_args["return_logprob"] and out.scores is not None:
-        step_lps = [F.log_softmax(s.float(), dim=-1) for s in out.scores]
-        token_logprobs_batched: list[list[list] | None] = []
-        for row in range(completions.shape[0]):
-            row_lps: list[list] = []
-            for t, lp in enumerate(step_lps):
-                token_id = int(completions[row, t].item())
-                row_lps.append([float(lp[row, token_id].item()), token_id, None])
-            token_logprobs_batched.append(row_lps)
+    if return_logprob and logprob_steps:
+        lp_matrix = torch.stack(logprob_steps, dim=1)  # [B, T]
+        token_logprobs_batched: list[list[list] | None] = [
+            [
+                [float(lp_matrix[row, t].item()), int(completions[row, t].item()), None]
+                for t in range(completions.shape[1])
+            ]
+            for row in range(batch_size)
+        ]
     else:
-        token_logprobs_batched = [None] * completions.shape[0]
+        token_logprobs_batched = [None] * batch_size
 
-    n = gen_args["n"]
     results: list[dict] = []
-    for local_idx in range(input_ids.shape[0]):
+    for local_idx in range(len(prompts)):
         global_idx = indices[local_idx]
         for k in range(n):
             flat = local_idx * n + k
@@ -399,14 +635,7 @@ def _worker_main(
     device = torch.device(args.device)
     model = model.to(device).eval()
 
-    if device.type == "privateuseone" or os.environ.get("ON_NEURON") == "1":
-        logger.info(f"[worker {rank}] compiling model.forward (backend='neuron')")
-        model._rollout_forward = torch.compile(
-            model.forward, backend="neuron", fullgraph=True, dynamic=False
-        )
-        model.forward = model._rollout_forward
-    else:
-        logger.info(f"[worker {rank}] skipping torch.compile (non-Neuron device)")
+    engine = _WorkerEngine(rank, model, tokenizer, device, args)
 
     param_map = dict(model.named_parameters())
     ready_q.put(rank)
@@ -464,9 +693,7 @@ def _worker_main(
         if kind == "generate":
             _, req_id, indexed_prompts, gen_args = req
             try:
-                result = _worker_generate(
-                    model, tokenizer, device, args, indexed_prompts, gen_args
-                )
+                result = _worker_generate(engine, args, indexed_prompts, gen_args)
                 res_q.put((req_id, rank, "ok", result))
             except Exception as exc:
                 logger.exception(f"[worker {rank}] generate failed")
@@ -497,6 +724,16 @@ class RouterState:
 
 
 def _route_generate(state: "RouterState", req: "GenerateRequest") -> dict:
+    if req.max_new_tokens > state.args.max_new_tokens:
+        # The static KV cache is allocated at server start; longer requests
+        # would silently truncate, so refuse them instead.
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": f"max_new_tokens={req.max_new_tokens} exceeds the server's "
+                f"--max-new-tokens={state.args.max_new_tokens} (static cache size)"
+            },
+        )
     N = state.world_size
     # Round-robin shard; preserves global prompt index for reassembly on return.
     shards: list[list[tuple[int, str]]] = [[] for _ in range(N)]
@@ -661,6 +898,15 @@ def main(script_args: ScriptArguments):
 
     state = RouterState()
     state.args = script_args
+
+    # The padded prompt length must split into whole prefill chunks; validate
+    # at startup rather than failing on the first request.
+    pad_unit = math.lcm(max(script_args.pad_to_multiple, 1), script_args.prefill_chunk_size)
+    if script_args.max_prompt_length % pad_unit != 0:
+        raise ValueError(
+            f"--max-prompt-length ({script_args.max_prompt_length}) must be a multiple of "
+            f"lcm(--pad-to-multiple, --prefill-chunk-size) = {pad_unit}"
+        )
 
     visible_env = os.environ.get("NEURON_RT_VISIBLE_CORES", "")
     if visible_env:
